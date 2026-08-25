@@ -48,8 +48,10 @@ import type {
   WithdrawParams,
   WriteOptions,
   OperationExplanation,
+  SimulateStreamResult,
+  SimulateStreamSnapshot,
 } from './types.js';
-import { streamToJSON, filterStreams } from './utils.js';
+import { streamToJSON, filterStreams, calculateFlowRate } from './utils.js';
 
 let nextId = 1;
 
@@ -745,6 +747,56 @@ export class MockSoroStreamClient {
 
   getConnectionStats(): { maxConnections: number; active: number; idle: number; reused: number } {
     return { maxConnections: 5, active: 0, idle: 0, reused: 0 };
+  }
+
+  // ── Issue #398: simulateStream ────────────────────────────────────────────
+
+  /**
+   * Projects a stream's token flow over time without submitting any on-chain transaction.
+   * Pure synchronous method — no RPC calls are made.
+   *
+   * @param params - amount (stroops) and durationSeconds.
+   * @param durationSeconds - Override projection window. Defaults to params.durationSeconds.
+   * @param sampleCount - Number of snapshots to generate (default: 10, minimum: 2).
+   * @returns SimulateStreamResult with snapshots at regular intervals.
+   */
+  simulateStream(
+    params: Pick<CreateStreamParams, 'amount' | 'durationSeconds'>,
+    durationSeconds?: number,
+    sampleCount?: number,
+  ): SimulateStreamResult {
+    const projectedDuration = durationSeconds ?? params.durationSeconds;
+    const resolvedSampleCount = Math.max(2, sampleCount ?? 10);
+
+    const totalDeposit = params.amount;
+    const flowRate = calculateFlowRate(totalDeposit, projectedDuration);
+
+    const snapshots: SimulateStreamSnapshot[] = [];
+    const interval = projectedDuration / (resolvedSampleCount - 1);
+
+    for (let i = 0; i < resolvedSampleCount; i++) {
+      const elapsedSeconds =
+        i === resolvedSampleCount - 1 ? projectedDuration : Math.round(interval * i);
+
+      const rawStreamed = flowRate * BigInt(elapsedSeconds);
+      const streamed = rawStreamed > totalDeposit ? totalDeposit : rawStreamed;
+      const remaining = totalDeposit - streamed;
+      const percentStreamed =
+        totalDeposit === 0n ? 0 : Number((streamed * 10000n) / totalDeposit) / 100;
+
+      snapshots.push({ elapsedSeconds, streamed, remaining, percentStreamed });
+    }
+
+    const rawTotalStreamed = flowRate * BigInt(projectedDuration);
+    const totalStreamed = rawTotalStreamed > totalDeposit ? totalDeposit : rawTotalStreamed;
+
+    return {
+      totalDeposit,
+      flowRate,
+      durationSeconds: projectedDuration,
+      snapshots,
+      totalStreamed,
+    };
   }
 }
 

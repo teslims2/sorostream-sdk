@@ -167,10 +167,12 @@ import type {
   ConfigUpdatedEvent,
   RecipientTrustScore,
   RecipientTrustScoreProvider,
+  SimulateStreamResult,
+  SimulateStreamSnapshot,
 } from './types.js';
 import { withRetry, type RetryOptions } from './retry.js';
 import type { EventPollerOptions, StreamRetryPolicy } from './events.js';
-import { calculateVestingSchedule, streamToJSON, formatUSDC } from './utils.js';
+import { calculateVestingSchedule, streamToJSON, formatUSDC, calculateFlowRate } from './utils.js';
 import { checkPeerDependencies } from './peerDependencies.js';
 import { PluginRegistry } from './pluginRegistry.js';
 import { getPortfolioStats } from './portfolioAnalytics.js';
@@ -4169,31 +4171,126 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     return new BatchBuilder(this as unknown as SoroStreamClient);
   }
 
+  /**
+   * Creates a wrapped writable that compresses data with gzip or deflate before passing it
+   * to the underlying writable. Dynamically imports Node.js `zlib` for compatibility with
+   * environments that may not have it (e.g., browser). Falls back to the raw writable if
+   * `zlib` is unavailable.
+   *
+   * @param writable - The target writable stream or write-capable object.
+   * @param algorithm - Compression algorithm: 'gzip' or 'deflate'.
+   * @returns An object with `.write(data)` and `.end()` methods.
+   */
+  private async createCompressedWritable(
+    writable: any,
+    algorithm: 'gzip' | 'deflate',
+  ): Promise<{ write: (data: string) => void; end: () => void }> {
+    try {
+      const zlib = await import('zlib');
+      const compressor =
+        algorithm === 'gzip' ? zlib.createGzip() : zlib.createDeflate();
+
+      // Pipe compressor output to the underlying writable
+      compressor.on('data', (chunk: Buffer) => {
+        if (typeof writable.write === 'function') {
+          writable.write(chunk);
+        } else if (typeof writable.getWriter === 'function') {
+          const writer = writable.getWriter();
+          writer.write(chunk);
+          if (typeof writer.releaseLock === 'function') {
+            writer.releaseLock();
+          }
+        }
+      });
+
+      compressor.on('end', () => {
+        if (typeof writable.end === 'function') {
+          writable.end();
+        }
+      });
+
+      return {
+        write: (data: string) => {
+          compressor.write(data);
+        },
+        end: () => {
+          compressor.end();
+        },
+      };
+    } catch {
+      // zlib not available (e.g., browser environment) — fall back to raw writable
+      return {
+        write: (data: string) => {
+          if (typeof writable.write === 'function') {
+            writable.write(data);
+          } else if (typeof writable.getWriter === 'function') {
+            const writer = writable.getWriter();
+            const encoder = new TextEncoder();
+            writer.write(encoder.encode(data));
+            if (typeof writer.releaseLock === 'function') {
+              writer.releaseLock();
+            }
+          }
+        },
+        end: () => {
+          if (typeof writable.end === 'function') {
+            writable.end();
+          }
+        },
+      };
+    }
+  }
+
+  /**
+   * Exports the activity history for a stream or address.
+   *
+   * @param addressOrId - The stream ID or wallet address to export history for.
+   * @param options - Export options including format, writable, limit, startLedger, and compression.
+   *   - `format`: 'json' (default) returns an array; 'ndjson' writes line-delimited JSON to `writable`.
+   *   - `writable`: Target writable stream. Required when `format` is 'ndjson' or `compression` is set.
+   *   - `compression`: Optional compression for the output when `writable` is set.
+   *     Use `'gzip'` or `'deflate'` to compress via Node.js `zlib`. No-ops gracefully in
+   *     environments without `zlib`. `'none'` (or omitting the option) disables compression.
+   * @returns Array of `StreamActivityEntry` when `format` is 'json'; `void` when streaming to a writable.
+   */
   async exportStreamHistory(
     addressOrId: string,
     options?: ExportStreamHistoryOptions,
   ): Promise<StreamActivityEntry[] | void> {
     const format = options?.format ?? 'json';
+    const compression = options?.compression;
     const { StreamIndexer } = await import('./indexer.js');
     const indexer = new StreamIndexer(this.server, this.contract.contractId());
 
     let cursor: string | undefined = undefined;
     const records: StreamActivityEntry[] = [];
 
+    // Set up a compressed (or raw) writable when compression is requested
+    let compressedWritable: { write: (data: string) => void; end: () => void } | null = null;
+    if (options?.writable && compression && compression !== 'none') {
+      compressedWritable = await this.createCompressedWritable(options.writable, compression);
+    }
+
+    const writeToStream = (data: string) => {
+      if (compressedWritable) {
+        compressedWritable.write(data);
+      } else if (typeof options?.writable?.write === 'function') {
+        options.writable.write(data);
+      } else if (typeof options?.writable?.getWriter === 'function') {
+        const writer = options.writable.getWriter();
+        const encoder = new TextEncoder();
+        writer.write(encoder.encode(data));
+        if (typeof writer.releaseLock === 'function') {
+          writer.releaseLock();
+        }
+      }
+    };
+
     const writeRecord = (entry: StreamActivityEntry) => {
       if (format === 'ndjson' && options?.writable) {
         const line =
           JSON.stringify(entry, (k, v) => (typeof v === 'bigint' ? v.toString() : v)) + '\n';
-        if (typeof options.writable.write === 'function') {
-          options.writable.write(line);
-        } else if (typeof options.writable.getWriter === 'function') {
-          const writer = options.writable.getWriter();
-          const encoder = new TextEncoder();
-          writer.write(encoder.encode(line));
-          if (typeof writer.releaseLock === 'function') {
-            writer.releaseLock();
-          }
-        }
+        writeToStream(line);
       } else {
         records.push(entry);
       }
@@ -4229,6 +4326,11 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       } else {
         hasMore = false;
       }
+    }
+
+    // Flush and close the compressor when done
+    if (compressedWritable) {
+      compressedWritable.end();
     }
 
     if (format === 'json') {
@@ -4318,6 +4420,70 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       );
       return { txHash };
     });
+  }
+
+  /**
+   * Projects a stream's token flow over time without submitting any on-chain transaction.
+   * Uses local simulation based on the provided parameters.
+   *
+   * This is a pure synchronous method — no RPC calls are made.
+   *
+   * @param params - Stream parameters: amount (total deposit in stroops) and durationSeconds.
+   * @param durationSeconds - How many seconds to project. Defaults to params.durationSeconds.
+   * @param sampleCount - Number of sample snapshots to include (default: 10, minimum: 2).
+   * @returns SimulateStreamResult with snapshots at regular intervals.
+   *
+   * @example
+   * ```ts
+   * const result = client.simulateStream(
+   *   { amount: toStroops("100"), durationSeconds: 30 * 24 * 60 * 60 },
+   * );
+   * console.log(result.flowRate);        // stroops/second
+   * console.log(result.snapshots[5]);    // midpoint snapshot
+   * ```
+   */
+  simulateStream(
+    params: Pick<CreateStreamParams, 'amount' | 'durationSeconds'>,
+    durationSeconds?: number,
+    sampleCount?: number,
+  ): SimulateStreamResult {
+    const projectedDuration = durationSeconds ?? params.durationSeconds;
+    const resolvedSampleCount = Math.max(2, sampleCount ?? 10);
+
+    const totalDeposit = params.amount;
+    const flowRate = calculateFlowRate(totalDeposit, projectedDuration);
+
+    const snapshots: SimulateStreamSnapshot[] = [];
+    const interval = projectedDuration / (resolvedSampleCount - 1);
+
+    for (let i = 0; i < resolvedSampleCount; i++) {
+      const elapsedSeconds = i === resolvedSampleCount - 1
+        ? projectedDuration
+        : Math.round(interval * i);
+
+      const rawStreamed = flowRate * BigInt(elapsedSeconds);
+      const streamed = rawStreamed > totalDeposit ? totalDeposit : rawStreamed;
+      const remaining = totalDeposit - streamed;
+      const percentStreamed =
+        totalDeposit === 0n
+          ? 0
+          : Number((streamed * 10000n) / totalDeposit) / 100;
+
+      snapshots.push({ elapsedSeconds, streamed, remaining, percentStreamed });
+    }
+
+    // totalStreamed is the actual amount that will be released (flowRate * duration,
+    // capped at the total deposit to account for integer division rounding).
+    const rawTotalStreamed = flowRate * BigInt(projectedDuration);
+    const totalStreamed = rawTotalStreamed > totalDeposit ? totalDeposit : rawTotalStreamed;
+
+    return {
+      totalDeposit,
+      flowRate,
+      durationSeconds: projectedDuration,
+      snapshots,
+      totalStreamed,
+    };
   }
 }
 
